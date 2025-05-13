@@ -8,13 +8,16 @@ import org.springframework.context.ApplicationContextAware;
 import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.stereotype.Component;
+import org.springframework.util.CollectionUtils;
 import org.springframework.util.StringUtils;
 import org.ylzl.eden.commons.lang.reflect.ReflectionUtils;
 import org.ylzl.eden.spring.framework.aop.util.AopUtils;
 
 import java.io.Serializable;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -46,23 +49,40 @@ public class CustomFunctionRegistrar implements ApplicationContextAware {
 	 * @param applicationContext ApplicationContext
 	 */
 	private void initialize(ApplicationContext applicationContext) {
-		Map<String, Object> components = applicationContext.getBeansWithAnnotation(Component.class);
-		components.values().forEach(component -> {
-			Method[] methods = component.getClass().getMethods();
+		String[] components = applicationContext.getBeanNamesForAnnotation(Component.class);
+		for (String component : components) {
+			Object bean;
+			try {
+				bean = applicationContext.getBean(component);
+			} catch (Exception e) {
+				log.debug("获取【{}】bean失败", component);
+				continue;
+			}
+			Method[] methods = bean.getClass().getMethods();
 			if (methods.length == 0) {
 				return;
 			}
 
-			Object targetObject = AopUtils.getDynamicProxyTargetObject(component);
+
+			List<CustomMethod> customMethods = new ArrayList<>();
 			for (Method method : methods) {
 				CustomFunction annotation = AnnotatedElementUtils.findMergedAnnotation(method, CustomFunction.class);
 				if (annotation == null) {
 					continue;
 				}
-				if (ReflectionUtils.isStaticMethod(method)) {
-					cache(annotation, method);
+				String registerName = StringUtils.hasText(annotation.value()) ? annotation.value() : method.getName();
+				if (java.lang.reflect.Modifier.isStatic(method.getModifiers())) {
+					cache(registerName, method);
 					continue;
 				}
+				CustomMethod customMethod = new CustomMethod();
+				customMethod.setRegisterName(registerName);
+				customMethod.setMethod(method);
+				customMethods.add(customMethod);
+			}
+
+			if (!CollectionUtils.isEmpty(customMethods)) {
+				Object targetObject = AopUtils.getDynamicProxyTargetObject(bean);
 				ClassPool pool = ClassPool.getDefault();
 				Class<?> targetClass = targetObject.getClass();
 				String staticallyClassName = targetClass.getName() + "_Statically";
@@ -70,24 +90,32 @@ public class CustomFunctionRegistrar implements ApplicationContextAware {
 				CtClass ctClass = pool.getOrNull(staticallyClassName);
 				try {
 					if (ctClass == null) {
-						ctClass = constructCtClass(method, pool, targetClass, staticallyClassName);
+						ctClass = constructCtClass(customMethods, pool, targetClass, staticallyClassName);
 						delegateClass = ctClass.toClass();
 					} else {
 						delegateClass = ctClass.getClass().getClassLoader().loadClass(staticallyClassName);
 					}
-					Object proxy = delegateClass.getConstructor(targetClass).newInstance(component);
+					Object proxy = delegateClass.getConstructor(targetClass).newInstance(bean);
 					Method[] proxyMethods = proxy.getClass().getDeclaredMethods();
 					Arrays.stream(proxyMethods).forEach(proxyMethod -> {
-						if (Arrays.equals(method.getParameterTypes(), proxyMethod.getParameterTypes()) &&
-							method.getName().equals(proxyMethod.getName())) {
-							cache(annotation, proxyMethod);
+						for (CustomMethod customMethod : customMethods) {
+							Method method = customMethod.getMethod();
+							String registerName = customMethod.getRegisterName();
+							if (Arrays.equals(method.getParameterTypes(), proxyMethod.getParameterTypes()) &&
+								method.getName().equals(proxyMethod.getName())) {
+								cache(registerName, proxyMethod);
+							}
 						}
 					});
 				} catch (Exception e) {
 					throw new RuntimeException(e);
 				}
 			}
-		});
+
+
+		}
+
+
 	}
 
 	/**
@@ -99,13 +127,15 @@ public class CustomFunctionRegistrar implements ApplicationContextAware {
 		FUNCTION_CACHE.forEach(context::registerFunction);
 	}
 
-	private static void cache(CustomFunction annotation, Method method) {
-		String registerName = StringUtils.hasText(annotation.value()) ? annotation.value() : method.getName();
-		FUNCTION_CACHE.put(registerName, method);
+	private static void cache(String registerName, Method method) {
+		Method oldValue = FUNCTION_CACHE.put(registerName, method);
+		if (oldValue != null) {
+			throw new RuntimeException("Duplicate custom function names: " + oldValue.getName());
+		}
 		log.info("Register custom function '{}' as name '{}'", method, registerName);
 	}
 
-	private CtClass constructCtClass(Method method, ClassPool pool, Class<?> targetClass, String staticallyClassName)
+	private CtClass constructCtClass(List<CustomMethod> customMethods, ClassPool pool, Class<?> targetClass, String staticallyClassName)
 		throws NotFoundException, CannotCompileException {
 		CtClass ctClass = pool.makeClass(staticallyClassName);
 		ctClass.addInterface(pool.get(Serializable.class.getName()));
@@ -123,43 +153,47 @@ public class CustomFunctionRegistrar implements ApplicationContextAware {
 		getterMethod.setBody("{return delegating;}");
 		ctClass.addMethod(getterMethod);
 
-		int modifier = method.getModifiers();
-		modifier |= javassist.Modifier.STATIC;
-		String methodName = method.getName();
-		Class<?> returnType = method.getReturnType();
-		StringBuilder builder = new StringBuilder();
-		builder.append(chooseModifier(modifier)).append(" ")
-			.append(returnType.getName()).append(" ")
-			.append(methodName).append("(");
+		for (CustomMethod customMethod : customMethods) {
+			Method method = customMethod.getMethod();
+			int modifier = method.getModifiers();
+			modifier |= javassist.Modifier.STATIC;
+			String methodName = method.getName();
+			Class<?> returnType = method.getReturnType();
+			StringBuilder builder = new StringBuilder();
+			builder.append(chooseModifier(modifier)).append(" ")
+				.append(returnType.getName()).append(" ")
+				.append(methodName).append("(");
 
-		Class<?>[] parameterType = method.getParameterTypes();
-		StringBuilder params = null;
-		for (int i = 0; i < parameterType.length; i++) {
-			builder.append(parameterType[i].getName()).append(" ");
-			builder.append("$_").append(i).append(",");
-			if (params == null) {
-				params = new StringBuilder();
+			Class<?>[] parameterType = method.getParameterTypes();
+			StringBuilder params = null;
+			for (int i = 0; i < parameterType.length; i++) {
+				builder.append(parameterType[i].getName()).append(" ");
+				builder.append("$_").append(i).append(",");
+				if (params == null) {
+					params = new StringBuilder();
+				}
+				params.append("$_").append(i).append(",");
 			}
-			params.append("$_").append(i).append(",");
-		}
-		if (params != null) {
-			builder.delete(builder.length() - 1, builder.length());
-			params.delete(params.length() - 1, params.length());
-		}
-		builder.append(")");
-		builder.append("{");
-		if (!returnType.equals(void.class)) {
-			builder.append("return").append(" ");
-		}
-		builder.append("delegating.").append(methodName).append("(");
-		if (params != null) {
-			builder.append(params);
-		}
-		builder.append(")").append(";");
-		builder.append("}");
+			if (params != null) {
+				builder.delete(builder.length() - 1, builder.length());
+				params.delete(params.length() - 1, params.length());
+			}
+			builder.append(")");
+			builder.append("{");
+			if (!returnType.equals(void.class)) {
+				builder.append("return").append(" ");
+			}
+			builder.append("delegating.").append(methodName).append("(");
+			if (params != null) {
+				builder.append(params);
+			}
+			builder.append(")").append(";");
+			builder.append("}");
 
-		CtMethod ctMethod = CtMethod.make(builder.toString(), ctClass);
-		ctClass.addMethod(ctMethod);
+			CtMethod ctMethod = CtMethod.make(builder.toString(), ctClass);
+			ctClass.addMethod(ctMethod);
+		}
+
 		return ctClass;
 	}
 
